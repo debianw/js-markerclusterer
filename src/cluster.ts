@@ -14,65 +14,240 @@
  * limitations under the License.
  */
 
-export interface ClusterOptions {
-  position?: google.maps.LatLng | google.maps.LatLngLiteral;
+import { Algorithm, SuperClusterAlgorithm } from "./algorithms";
+import { ClusterStats, DefaultRenderer, Renderer } from "./renderer";
+import { Cluster } from "./cluster";
+import { OverlayViewSafe } from "./overlay-view-safe";
+
+export type onClusterClickHandler = (
+  event: google.maps.MapMouseEvent,
+  cluster: Cluster,
+  map: google.maps.Map
+) => void;
+export interface MarkerClustererOptions {
   markers?: google.maps.Marker[];
+  /**
+   * An algorithm to cluster markers. Default is {@link SuperClusterAlgorithm}. Must
+   * provide a `calculate` method accepting {@link AlgorithmInput} and returning
+   * an array of {@link Cluster}.
+   */
+  algorithm?: Algorithm;
+  map?: google.maps.Map | null;
+  /**
+   * An object that converts a {@link Cluster} into a `google.maps.Marker`.
+   * Default is {@link DefaultRenderer}.
+   */
+  renderer?: Renderer;
+  onClusterClick?: onClusterClickHandler;
 }
 
-export class Cluster {
-  public marker: google.maps.Marker;
-  public readonly markers?: google.maps.Marker[];
-  protected _position: google.maps.LatLng;
+export enum MarkerClustererEvents {
+  CLUSTERING_BEGIN = "clusteringbegin",
+  CLUSTERING_END = "clusteringend",
+  CLUSTER_CLICK = "click",
+}
 
-  constructor({ markers, position }: ClusterOptions) {
-    this.markers = markers;
+export const defaultOnClusterClickHandler: onClusterClickHandler = (
+  _: google.maps.MapMouseEvent,
+  cluster: Cluster,
+  map: google.maps.Map
+): void => {
+  map.fitBounds(cluster.bounds);
+};
 
-    if (position) {
-      if (position instanceof google.maps.LatLng) {
-        this._position = position;
-      } else {
-        this._position = new google.maps.LatLng(position);
-      }
+export const setMarkerMap = (marker: google.maps.Marker | google.maps.marker.AdvancedMarkerView, map?: google.maps.Map) => {
+  if (google.maps.marker && marker instanceof google.maps.marker.AdvancedMarkerView) {
+    marker.map = map;
+  } else if (marker instanceof google.maps.Marker){
+    marker.setMap(map);
+  }
+  return;
+}
+
+/**
+ * MarkerClusterer creates and manages per-zoom-level clusters for large amounts
+ * of markers. See {@link MarkerClustererOptions} for more details.
+ *
+ */
+export class MarkerClusterer extends OverlayViewSafe {
+  /** @see {@link MarkerClustererOptions.onClusterClick} */
+  public onClusterClick: onClusterClickHandler;
+  /** @see {@link MarkerClustererOptions.algorithm} */
+  protected algorithm: Algorithm;
+  protected clusters: Cluster[];
+  protected markers: google.maps.Marker[];
+  /** @see {@link MarkerClustererOptions.renderer} */
+  protected renderer: Renderer;
+  /** @see {@link MarkerClustererOptions.map} */
+  protected map: google.maps.Map | null;
+  /** @see {@link MarkerClustererOptions.maxZoom} */
+  protected idleListener: google.maps.MapsEventListener;
+
+  constructor({
+    map,
+    markers = [],
+    algorithm = new SuperClusterAlgorithm({}),
+    renderer = new DefaultRenderer(),
+    onClusterClick = defaultOnClusterClickHandler,
+  }: MarkerClustererOptions) {
+    super();
+    this.markers = [...markers];
+    this.clusters = [];
+
+    this.algorithm = algorithm;
+    this.renderer = renderer;
+
+    this.onClusterClick = onClusterClick;
+
+    if (map) {
+      this.setMap(map);
     }
   }
 
-  public get bounds(): google.maps.LatLngBounds | undefined {
-    if (this.markers.length === 0 && !this._position) {
-      return undefined;
+  public addMarker(marker: google.maps.Marker, noDraw?: boolean): void {
+    if (this.markers.includes(marker)) {
+      return;
     }
 
-    return this.markers.reduce((bounds, marker) => {
-      return bounds.extend(marker.getPosition());
-    }, new google.maps.LatLngBounds(this._position, this._position));
-  }
-
-  public get position(): google.maps.LatLng {
-    return this._position || this.bounds.getCenter();
-  }
-
-  /**
-   * Get the count of **visible** markers.
-   */
-  public get count(): number {
-    return this.markers.filter((m: google.maps.Marker) => m.getVisible())
-      .length;
-  }
-
-  /**
-   * Add a marker to the cluster.
-   */
-  public push(marker: google.maps.Marker): void {
     this.markers.push(marker);
+    if (!noDraw) {
+      this.render();
+    }
+  }
+
+  public addMarkers(markers: google.maps.Marker[], noDraw?: boolean): void {
+    markers.forEach((marker) => {
+      this.addMarker(marker, true);
+    });
+
+    if (!noDraw) {
+      this.render();
+    }
+  }
+
+  public removeMarker(marker: google.maps.Marker, noDraw?: boolean): boolean {
+    const index = this.markers.indexOf(marker);
+
+    if (index === -1) {
+      // Marker is not in our list of markers, so do nothing:
+      return false;
+    }
+
+    marker.setMap(null);
+    this.markers.splice(index, 1); // Remove the marker from the list of managed markers
+
+    if (!noDraw) {
+      this.render();
+    }
+
+    return true;
+  }
+
+  public removeMarkers(
+    markers: google.maps.Marker[],
+    noDraw?: boolean
+  ): boolean {
+    let removed = false;
+
+    markers.forEach((marker) => {
+      removed = this.removeMarker(marker, true) || removed;
+    });
+
+    if (removed && !noDraw) {
+      this.render();
+    }
+
+    return removed;
+  }
+
+  public clearMarkers(noDraw?: boolean): void {
+    this.markers.length = 0;
+
+    if (!noDraw) {
+      this.render();
+    }
   }
 
   /**
-   * Cleanup references and remove marker from map.
+   * Recalculates and draws all the marker clusters.
    */
-  public delete(): void {
-    if (this.marker) {
-      this.marker.setMap(null);
-      delete this.marker;
+  public render(): void {
+    const map = this.getMap();
+    if (map instanceof google.maps.Map && this.getProjection()) {
+      google.maps.event.trigger(
+        this,
+        MarkerClustererEvents.CLUSTERING_BEGIN,
+        this
+      );
+      const { clusters, changed } = this.algorithm.calculate({
+        markers: this.markers,
+        map,
+        mapCanvasProjection: this.getProjection(),
+      });
+
+      // allow algorithms to return flag on whether the clusters/markers have changed
+      if (changed || changed == undefined) {
+        // reset visibility of markers and clusters
+        this.reset();
+
+        // store new clusters
+        this.clusters = clusters;
+
+        this.renderClusters();
+      }
+      google.maps.event.trigger(
+        this,
+        MarkerClustererEvents.CLUSTERING_END,
+        this
+      );
     }
-    this.markers.length = 0;
+  }
+
+  public onAdd(): void {
+    this.idleListener = this.getMap().addListener(
+      "idle",
+      this.render.bind(this)
+    );
+    this.render();
+  }
+
+  public onRemove(): void {
+    google.maps.event.removeListener(this.idleListener);
+    this.reset();
+  }
+
+  protected reset(): void {
+    this.markers.forEach((marker) => marker.setMap(null));
+    this.clusters.forEach((cluster) => cluster.delete());
+    this.clusters = [];
+  }
+
+  protected renderClusters(): void {
+    // generate stats to pass to renderers
+    const stats = new ClusterStats(this.markers, this.clusters);
+    const map = this.getMap() as google.maps.Map;
+
+    this.clusters.forEach((cluster) => {
+      if (cluster.markers.length === 1) {
+        cluster.marker = cluster.markers[0];
+      } else {
+        cluster.marker = this.renderer.render(cluster, stats, map);
+        if (this.onClusterClick) {
+          cluster.marker.addListener(
+            "click",
+            /* istanbul ignore next */
+            (event: google.maps.MapMouseEvent) => {
+              google.maps.event.trigger(
+                this,
+                MarkerClustererEvents.CLUSTER_CLICK,
+                cluster
+              );
+              this.onClusterClick(event, cluster, map);
+            }
+          );
+        }
+      }
+      setMarkerMap(cluster.marker, map);
+    });
   }
 }
